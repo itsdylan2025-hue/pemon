@@ -1,0 +1,409 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.4
+
+      - name: Accept licenses and install SDK
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-33" "build-tools;33.0.2" || true
+
+      - name: Generate project files
+        run: |
+          mkdir -p app/src/main/java/com/batteryicon/overlay
+
+          cat > settings.gradle << 'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "IOSBatteryOverlay"
+          include ':app'
+          EOF
+
+          cat > build.gradle << 'EOF'
+          plugins {
+              id 'com.android.application' version '8.1.4' apply false
+          }
+          EOF
+
+          cat > gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          EOF
+
+          cat > app/build.gradle << 'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'com.batteryicon.overlay'
+              compileSdk 33
+              defaultConfig {
+                  applicationId 'com.batteryicon.overlay'
+                  minSdk 26
+                  targetSdk 33
+                  versionCode 2
+                  versionName '2.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_11
+                  targetCompatibility JavaVersion.VERSION_11
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <application
+                  android:label="Battery Number"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".OverlayService" android:exported="false" />
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/batteryicon/overlay/OverlayService.java << 'EOF'
+          package com.batteryicon.overlay;
+
+          import android.app.*;
+          import android.content.*;
+          import android.graphics.Color;
+          import android.graphics.PixelFormat;
+          import android.graphics.Typeface;
+          import android.os.*;
+          import android.util.TypedValue;
+          import android.view.Gravity;
+          import android.view.WindowManager;
+          import android.widget.TextView;
+          import java.io.File;
+
+          public class OverlayService extends Service {
+              static boolean running = false;
+              WindowManager wm;
+              TextView tv;
+              WindowManager.LayoutParams lp;
+              int level = 100;
+
+              BroadcastReceiver receiver = new BroadcastReceiver() {
+                  @Override
+                  public void onReceive(Context c, Intent i) {
+                      if (Intent.ACTION_BATTERY_CHANGED.equals(i.getAction())) {
+                          int l = i.getIntExtra(BatteryManager.EXTRA_LEVEL, 100);
+                          int sc = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
+                          level = l * 100 / sc;
+                          tv.setText(String.valueOf(level));
+                      }
+                  }
+              };
+
+              @Override
+              public void onCreate() {
+                  super.onCreate();
+                  NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                  nm.createNotificationChannel(new NotificationChannel("bat", "Battery number",
+                          NotificationManager.IMPORTANCE_MIN));
+                  Notification n = new Notification.Builder(this, "bat")
+                          .setContentTitle("Battery number running")
+                          .setSmallIcon(android.R.drawable.ic_lock_idle_charging)
+                          .build();
+                  startForeground(1, n);
+
+                  wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+                  tv = new TextView(this);
+                  tv.setBackgroundColor(Color.TRANSPARENT);
+                  tv.setIncludeFontPadding(false);
+                  tv.setText(String.valueOf(level));
+
+                  lp = new WindowManager.LayoutParams(
+                          WindowManager.LayoutParams.WRAP_CONTENT,
+                          WindowManager.LayoutParams.WRAP_CONTENT,
+                          WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                  | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                                  | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                                  | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                          PixelFormat.TRANSLUCENT);
+                  lp.gravity = Gravity.TOP | Gravity.START;
+                  if (Build.VERSION.SDK_INT >= 30) {
+                      lp.layoutInDisplayCutoutMode =
+                              WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+                  } else if (Build.VERSION.SDK_INT >= 28) {
+                      lp.layoutInDisplayCutoutMode =
+                              WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+                  }
+                  applyPrefs();
+                  try {
+                      wm.addView(tv, lp);
+                  } catch (Exception e) {
+                      stopSelf();
+                      return;
+                  }
+                  registerReceiver(receiver, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+                  running = true;
+              }
+
+              void applyPrefs() {
+                  SharedPreferences p = getSharedPreferences("cfg", MODE_PRIVATE);
+                  tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, p.getInt("size", 14));
+                  tv.setTextColor(p.getInt("color", Color.WHITE));
+                  Typeface tf = Typeface.DEFAULT;
+                  File f = new File(getFilesDir(), "font.ttf");
+                  if (f.exists()) {
+                      try {
+                          tf = Typeface.createFromFile(f);
+                      } catch (Exception ignored) {
+                      }
+                  }
+                  tv.setTypeface(tf);
+                  lp.x = p.getInt("x", 100);
+                  lp.y = p.getInt("y", 60);
+              }
+
+              @Override
+              public int onStartCommand(Intent i, int flags, int id) {
+                  if (i != null && "STOP".equals(i.getAction())) {
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+                  applyPrefs();
+                  try {
+                      wm.updateViewLayout(tv, lp);
+                  } catch (Exception ignored) {
+                  }
+                  return START_STICKY;
+              }
+
+              @Override
+              public void onDestroy() {
+                  running = false;
+                  try {
+                      unregisterReceiver(receiver);
+                  } catch (Exception ignored) {
+                  }
+                  try {
+                      wm.removeView(tv);
+                  } catch (Exception ignored) {
+                  }
+                  super.onDestroy();
+              }
+
+              @Override
+              public IBinder onBind(Intent i) {
+                  return null;
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/batteryicon/overlay/MainActivity.java << 'EOF'
+          package com.batteryicon.overlay;
+
+          import android.app.Activity;
+          import android.content.*;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.net.Uri;
+          import android.os.*;
+          import android.provider.Settings;
+          import android.util.DisplayMetrics;
+          import android.widget.*;
+          import java.io.*;
+
+          public class MainActivity extends Activity {
+              static final int PICK_FONT = 2;
+              SharedPreferences p;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  p = getSharedPreferences("cfg", MODE_PRIVATE);
+                  DisplayMetrics dm = getResources().getDisplayMetrics();
+                  int pad = (int) (16 * dm.density);
+                  int extra = 1000;
+
+                  ScrollView sv = new ScrollView(this);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(pad, pad * 2, pad, pad);
+                  sv.addView(root);
+
+                  TextView title = new TextView(this);
+                  title.setText("Battery Number Overlay");
+                  title.setTextSize(24);
+                  root.addView(title);
+
+                  addSlider(root, "Position X", "x", -extra, dm.widthPixels + extra, 100);
+                  addSlider(root, "Position Y", "y", -extra, dm.heightPixels + extra, 60);
+                  addSlider(root, "Size", "size", 6, 150, 14);
+
+                  Button white = new Button(this);
+                  white.setText("White text");
+                  white.setOnClickListener(v -> setColor(Color.WHITE));
+                  root.addView(white);
+
+                  Button black = new Button(this);
+                  black.setText("Black text");
+                  black.setOnClickListener(v -> setColor(Color.BLACK));
+                  root.addView(black);
+
+                  Button font = new Button(this);
+                  font.setText("Choose custom font (.ttf)");
+                  font.setOnClickListener(v -> {
+                      Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                      i.addCategory(Intent.CATEGORY_OPENABLE);
+                      i.setType("*/*");
+                      startActivityForResult(i, PICK_FONT);
+                  });
+                  root.addView(font);
+
+                  Button resetFont = new Button(this);
+                  resetFont.setText("Reset font");
+                  resetFont.setOnClickListener(v -> {
+                      new File(getFilesDir(), "font.ttf").delete();
+                      notifyService();
+                      Toast.makeText(this, "Font reset", Toast.LENGTH_SHORT).show();
+                  });
+                  root.addView(resetFont);
+
+                  Button start = new Button(this);
+                  start.setText("Show battery number");
+                  start.setOnClickListener(v -> startOverlay());
+                  root.addView(start);
+
+                  Button stop = new Button(this);
+                  stop.setText("Hide battery number");
+                  stop.setOnClickListener(v -> {
+                      Intent i = new Intent(this, OverlayService.class);
+                      i.setAction("STOP");
+                      startService(i);
+                  });
+                  root.addView(stop);
+
+                  setContentView(sv);
+
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);
+                  }
+              }
+
+              void setColor(int c) {
+                  p.edit().putInt("color", c).apply();
+                  notifyService();
+              }
+
+              void notifyService() {
+                  if (OverlayService.running) {
+                      startService(new Intent(this, OverlayService.class));
+                  }
+              }
+
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (req != PICK_FONT || res != RESULT_OK || data == null || data.getData() == null) {
+                      return;
+                  }
+                  File out = new File(getFilesDir(), "font.ttf");
+                  try {
+                      InputStream in = getContentResolver().openInputStream(data.getData());
+                      FileOutputStream fo = new FileOutputStream(out);
+                      byte[] buf = new byte[8192];
+                      int n;
+                      while ((n = in.read(buf)) > 0) {
+                          fo.write(buf, 0, n);
+                      }
+                      fo.close();
+                      in.close();
+                      Typeface.createFromFile(out);
+                      Toast.makeText(this, "Font applied", Toast.LENGTH_SHORT).show();
+                      notifyService();
+                  } catch (Exception e) {
+                      out.delete();
+                      Toast.makeText(this, "That file isn't a valid font", Toast.LENGTH_LONG).show();
+                  }
+              }
+
+              void addSlider(LinearLayout root, String label, String key, int min, int max, int def) {
+                  TextView tv = new TextView(this);
+                  tv.setPadding(0, 40, 0, 0);
+                  SeekBar sb = new SeekBar(this);
+                  sb.setMax(max - min);
+                  int cur = p.getInt(key, def);
+                  if (cur < min) cur = min;
+                  if (cur > max) cur = max;
+                  sb.setProgress(cur - min);
+                  tv.setText(label + ": " + cur);
+                  sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      @Override
+                      public void onProgressChanged(SeekBar s, int v, boolean user) {
+                          int real = v + min;
+                          p.edit().putInt(key, real).apply();
+                          tv.setText(label + ": " + real);
+                          notifyService();
+                      }
+
+                      @Override
+                      public void onStartTrackingTouch(SeekBar s) {
+                      }
+
+                      @Override
+                      public void onStopTrackingTouch(SeekBar s) {
+                      }
+                  });
+                  root.addView(tv);
+                  root.addView(sb);
+              }
+
+              void startOverlay() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      Toast.makeText(this, "Allow 'Display over other apps', then come back", Toast.LENGTH_LONG).show();
+                      startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                              Uri.parse("package:" + getPackageName())));
+                      return;
+                  }
+                  if (OverlayService.running) {
+                      startService(new Intent(this, OverlayService.class));
+                  } else {
+                      startForegroundService(new Intent(this, OverlayService.class));
+                  }
+              }
+          }
+          EOF
+
+      - name: Build APK
+        run: gradle assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iOS-Battery-Overlay-APK
+          path: app/build/outputs/apk/debug/*.apk
